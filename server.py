@@ -3,12 +3,28 @@
 
 import json
 import os
-import subprocess
+import urllib.request
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 MONDAY_TOKEN = os.environ.get("MONDAY_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 MONDAY_BOARD_ID = "9431876463"
+
+
+def _http_post_json(url, headers, payload, timeout):
+    """POST JSON via stdlib urllib. Returns (status_code, response_text)."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        return e.code, body
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -75,50 +91,38 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return []
 
         prompt = f"""Extract action items from this meeting transcript.
-
 Meeting: {meeting_title}
-
 Transcript: {transcript}
-
 Return a JSON array of action items. Each item should have:
 - title: concise action (10-50 chars)
 - owner: person responsible (name or "Sam" if unclear)
 - due: estimated days to complete (1-30, or null)
 - priority: "high", "medium", or "low"
-
 Example format:
 [
   {{"title": "Finalize deck", "owner": "Sam", "due": 2, "priority": "high"}},
   {{"title": "Get budget approval", "owner": "Mary", "due": 1, "priority": "high"}}
 ]
-
 Return ONLY valid JSON array, no markdown or explanation."""
 
         try:
-            curl_cmd = [
-                "curl", "-s",
-                "-X", "POST",
-                "-H", "x-api-key: " + CLAUDE_API_KEY,
-                "-H", "anthropic-version: 2023-06-01",
-                "-H", "content-type: application/json",
-                "-d", json.dumps({
+            status, body = _http_post_json(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                payload={
                     "model": "claude-3-5-sonnet-20241022",
                     "max_tokens": 1024,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }),
-                "https://api.anthropic.com/v1/messages"
-            ]
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=15,
+            )
 
-            result = subprocess.run(curl_cmd, capture_output=True, timeout=15)
-
-            if result.returncode == 0:
-                response = json.loads(result.stdout.decode())
-
-                # Extract JSON from Claude response
+            if status == 200:
+                response = json.loads(body)
                 content = response.get("content", [{}])[0].get("text", "")
-
                 if content:
                     import re
                     match = re.search(r'\[.*\]', content, re.DOTALL)
@@ -126,6 +130,8 @@ Return ONLY valid JSON array, no markdown or explanation."""
                         items = json.loads(match.group())
                         print(f"  Claude extracted {len(items)} action items")
                         return items[:5]
+            else:
+                print(f"  Claude API HTTP {status}: {body[:200]}")
         except Exception as e:
             print(f"  Claude API failed: {e}")
 
@@ -158,29 +164,28 @@ Return ONLY valid JSON array, no markdown or explanation."""
     def create_monday_task(self, item):
         """Create task on Monday.com"""
         if not MONDAY_TOKEN:
+            print("    Skip: MONDAY_TOKEN not set")
             return False
 
         title = item.get("title", "Action item").replace('"', '\\"')
-
         query = f'mutation {{ create_item(board_id: {MONDAY_BOARD_ID}, item_name: "{title}") {{ id }} }}'
 
         try:
-            result = subprocess.run(
-                ["curl", "-s",
-                 "-H", f"Authorization: {MONDAY_TOKEN}",
-                 "-H", "Content-Type: application/json",
-                 "-d", json.dumps({"query": query}),
-                 "https://api.monday.com/v2"],
-                capture_output=True,
-                timeout=10
+            status, body = _http_post_json(
+                "https://api.monday.com/v2",
+                headers={"Authorization": MONDAY_TOKEN},
+                payload={"query": query},
+                timeout=10,
             )
 
-            response = json.loads(result.stdout.decode())
-
-            if response.get("data", {}).get("create_item"):
-                print(f"    Created: {title}")
-                return True
-
+            if status == 200:
+                response = json.loads(body)
+                if response.get("data", {}).get("create_item"):
+                    print(f"    Created: {title}")
+                    return True
+                print(f"    Monday returned no item. Body: {body[:200]}")
+            else:
+                print(f"    Monday HTTP {status}: {body[:200]}")
         except Exception as e:
             print(f"    Error: {e}")
 
