@@ -21,6 +21,9 @@ MONDAY_TOKEN = os.environ.get("MONDAY_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 MONDAY_BOARD_ID = "9431876463"
 
+# Map Claude priority -> Monday board status label (available: In Progress, Done, Stuck, Critical)
+PRIORITY_TO_STATUS = {"high": "Critical", "medium": "In Progress", "low": "Stuck"}
+
 def _http_post_json(url, headers, payload, timeout):
     """POST JSON via stdlib urllib. Returns (status_code, response_text)."""
     data = json.dumps(payload).encode("utf-8")
@@ -167,7 +170,8 @@ Return ONLY valid JSON array, no markdown or explanation."""
 
         title    = item.get("title", "Untitled task")[:100]
         owner    = item.get("owner", "Sam")
-        priority = item.get("priority", "medium")
+        priority = (item.get("priority") or "medium").lower()
+        monday_status = PRIORITY_TO_STATUS.get(priority, "In Progress")
 
         query = """mutation ($board: ID!, $name: String!, $vals: JSON!) {
             create_item (board_id: $board, item_name: $name, column_values: $vals) { id }
@@ -175,7 +179,7 @@ Return ONLY valid JSON array, no markdown or explanation."""
 
         column_values = json.dumps({
             "text":   owner,
-            "status": {"label": priority.capitalize()},
+            "status": {"label": monday_status},
         })
 
         try:
