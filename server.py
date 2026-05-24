@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -27,6 +28,58 @@ def _http_post_json(url, headers, payload, timeout):
         return e.code, body
 
 
+def _http_get(url, headers, timeout):
+    """GET via stdlib urllib. Returns (status_code, response_bytes)."""
+    req = urllib.request.Request(url, method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read() if e.fp else b""
+        return e.code, body
+
+
+def fetch_transcript(transcript_url, download_token):
+    """Download a Zoom .VTT transcript and return cleaned plain text."""
+    if not transcript_url:
+        return ""
+    headers = {}
+    if download_token:
+        headers["Authorization"] = f"Bearer {download_token}"
+    try:
+        status, body = _http_get(transcript_url, headers=headers, timeout=20)
+        if status != 200:
+            snippet = body[:200].decode("utf-8", errors="replace") if body else ""
+            print(f"  Transcript download HTTP {status}: {snippet}")
+            return ""
+        text = body.decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"  Transcript download failed: {e}")
+        return ""
+    return vtt_to_text(text)
+
+
+def vtt_to_text(vtt):
+    """Strip WEBVTT header, cue ids, and timestamps. Keep speaker lines."""
+    if not vtt:
+        return ""
+    out = []
+    for raw in vtt.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.upper().startswith("WEBVTT"):
+            continue
+        if "-->" in line:
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        out.append(line)
+    return " ".join(out)
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/webhook/transcript':
@@ -36,16 +89,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(body.decode())
                 meeting_title = payload.get("meeting_title", "Meeting")
-                transcript = payload.get("transcript", "")
 
-                # Extract action items with Claude
+                transcript_url = payload.get("transcript_url", "")
+                download_token = payload.get("download_token", "")
+                transcript = payload.get("transcript", "")
+                if transcript_url and not transcript:
+                    transcript = fetch_transcript(transcript_url, download_token)
+
+                # Extract action items with Claude (no fallback)
                 action_items = self.extract_with_claude(transcript, meeting_title)
 
-                # Fallback if Claude fails
-                if not action_items:
-                    action_items = self.simple_extract(transcript)
-
-                # Create Monday tasks
                 created_count = 0
                 for item in action_items:
                     if self.create_monday_task(item):
@@ -54,9 +107,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 response = {
                     "status": "success",
                     "meeting": meeting_title,
+                    "transcript_chars": len(transcript or ""),
                     "action_items_extracted": len(action_items),
                     "tasks_created": created_count,
-                    "action_items": action_items
+                    "action_items": action_items,
                 }
 
                 self.send_response(200)
@@ -64,7 +118,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps(response).encode())
 
-                print(f"{meeting_title} | {len(action_items)} items | {created_count} tasks")
+                print(f"{meeting_title} | transcript={len(transcript or '')} chars | {len(action_items)} items | {created_count} tasks")
             except Exception as e:
                 self.send_response(400)
                 self.send_header('Content-Type', 'application/json')
@@ -86,7 +140,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def extract_with_claude(self, transcript, meeting_title):
-        """Extract action items using Claude API"""
+        """Extract action items using Claude API. Returns [] on any failure."""
         if not CLAUDE_API_KEY or not transcript or len(transcript) < 50:
             return []
 
@@ -117,15 +171,14 @@ Return ONLY valid JSON array, no markdown or explanation."""
                     "max_tokens": 1024,
                     "messages": [{"role": "user", "content": prompt}],
                 },
-                timeout=15,
+                timeout=30,
             )
 
             if status == 200:
                 response = json.loads(body)
                 content = response.get("content", [{}])[0].get("text", "")
                 if content:
-                    import re
-                    match = re.search(r'\[.*\]', content, re.DOTALL)
+                    match = re.search(r"\[[\s\S]*?\]", content, re.DOTALL)
                     if match:
                         items = json.loads(match.group())
                         print(f"  Claude extracted {len(items)} action items")
@@ -137,66 +190,50 @@ Return ONLY valid JSON array, no markdown or explanation."""
 
         return []
 
-    def simple_extract(self, transcript):
-        """Fallback: simple keyword extraction"""
-        items = []
-
-        if not transcript or len(transcript) < 20:
-            return items
-
-        indicators = ["need to", "should", "will", "have to", "must", "need"]
-        sentences = transcript.split(". ")
-
-        for sentence in sentences[:5]:
-            sentence_lower = sentence.lower()
-            if any(ind in sentence_lower for ind in indicators):
-                title = sentence.strip()[:50]
-                if len(title) > 10:
-                    items.append({
-                        "title": title,
-                        "owner": "Sam",
-                        "due": 3,
-                        "priority": "medium"
-                    })
-
-        return items[:3]
-
     def create_monday_task(self, item):
         """Create task on Monday.com"""
         if not MONDAY_TOKEN:
             print("    Skip: MONDAY_TOKEN not set")
             return False
 
-        title = item.get("title", "Action item").replace('"', '\\"')
-        query = f'mutation {{ create_item(board_id: {MONDAY_BOARD_ID}, item_name: "{title}") {{ id }} }}'
+        title = item.get("title", "Untitled task")[:100]
+        owner = item.get("owner", "Sam")
+        priority = item.get("priority", "medium")
+
+        query = """mutation ($board: ID!, $name: String!, $vals: JSON!) {
+            create_item (board_id: $board, item_name: $name, column_values: $vals) { id }
+        }"""
+
+        column_values = json.dumps({
+            "text": owner,
+            "status": {"label": priority.capitalize()},
+        })
 
         try:
             status, body = _http_post_json(
                 "https://api.monday.com/v2",
                 headers={"Authorization": MONDAY_TOKEN},
-                payload={"query": query},
+                payload={
+                    "query": query,
+                    "variables": {
+                        "board": MONDAY_BOARD_ID,
+                        "name": title,
+                        "vals": column_values,
+                    },
+                },
                 timeout=10,
             )
-
-            if status == 200:
-                response = json.loads(body)
-                if response.get("data", {}).get("create_item"):
-                    print(f"    Created: {title}")
-                    return True
-                print(f"    Monday returned no item. Body: {body[:200]}")
-            else:
-                print(f"    Monday HTTP {status}: {body[:200]}")
+            if status == 200 and "errors" not in body:
+                print(f"    Created: {title}")
+                return True
+            print(f"    Monday error: {body[:200]}")
         except Exception as e:
-            print(f"    Error: {e}")
-
+            print(f"    Monday failed: {e}")
         return False
 
-    def log_message(self, format, *args):
-        pass
 
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     print(f"Server on port {port}")
     server.serve_forever()
