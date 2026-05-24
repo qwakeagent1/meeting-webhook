@@ -113,7 +113,7 @@ Return ONLY valid JSON array, no markdown or explanation."""
                     "anthropic-version": "2023-06-01",
                 },
                 payload={
-                    "model": "claude-3-5-sonnet-latest",
+                    "model": "claude-sonnet-4-5",
                     "max_tokens": 1024,
                     "messages": [{"role": "user", "content": prompt}],
                 },
